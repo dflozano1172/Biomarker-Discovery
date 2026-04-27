@@ -1,6 +1,6 @@
 # =============================================================================
-# OBJECTIVE 4: Change Over Time Stratified by Baseline WHO Severity (v2)
-# Question:    Do marker trajectories differ by baseline WHO severity class?
+# OBJECTIVE 4: Change Over Time Stratified by Baseline Severity (v2)
+# Question:    Do marker trajectories differ by baseline severity class?
 #
 # Primary:     LMM with Time × WHO interaction (categorical WHO)
 #              — pre-specified reference: most common WHO category
