@@ -265,24 +265,29 @@ cat("\nDiagnostic plots saved to: diagnostic_plots_obj3.pdf\n")
 # 6. COOK'S DISTANCE — influence diagnostics via influence.ME
 # =============================================================================
 
-run_influence <- function(mk) {
-
-  fit    <- lmm_results[[mk]]$fit
-  infl   <- influence(fit, group = "subject_id")
-  cooks  <- cooks.distance(infl)
-
-  # Flag subjects with Cook's D > 4/n
+run_influence <- function(mk, data) {
+  # Push to global env under a fixed name that influence.ME can find
+  .influence_data <<- data |>
+    dplyr::filter(marker == mk) |>
+    dplyr::filter(!is.na(log_value), !is.na(age), !is.na(sex), !is.na(bmi))
+  
+  fit <- lmer(log_value ~ time_bin + age + sex + bmi + (1 | subject_id),
+              data = .influence_data, REML = TRUE)
+  
+  infl      <- influence(fit, group = "subject_id", data = .influence_data)
+  cooks     <- cooks.distance(infl)
   n_subj    <- length(cooks)
   threshold <- 4 / n_subj
   flagged   <- names(cooks[cooks > threshold])
-
+  
   cat(sprintf("\n%s — Cook's D threshold (4/n = %.4f): %d subject(s) flagged: %s\n",
               mk, threshold, length(flagged),
               if (length(flagged) == 0) "none" else paste(flagged, collapse = ", ")))
 }
 
-cat("\n=== Cook's Distance (LMM influence) ===\n")
-walk(markers_list, run_influence)
+walk(markers_list, run_influence, data = df_raw)
+# Clean up afterwards
+rm(.influence_data, envir = globalenv())
 
 # =============================================================================
 # 7. FOREST PLOT — GMR with 95% CI for all markers
