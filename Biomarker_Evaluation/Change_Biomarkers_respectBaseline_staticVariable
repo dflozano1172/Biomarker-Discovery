@@ -1,0 +1,793 @@
+# =============================================================================
+# OBJECTIVE 4: Change Over Time Stratified by Baseline WHO Severity (v2)
+# Question:    Do marker trajectories differ by baseline WHO severity class?
+#
+# Primary:     LMM with Time × WHO interaction (categorical WHO)
+#              — pre-specified reference: most common WHO category
+#              — Type III F-test + LRT vs null model
+#              — pairwise WHO contrasts (BH-corrected)
+#              — partial η² effect size for interaction
+#              — random slope model check (AIC)
+# Secondary:   LMM with Time × WHO interaction (ordinal WHO — trend test)
+# Sensitivity: (a) Dichotomised WHO (mild-moderate vs severe-critical)
+#              (b) Exclude sparse extreme WHO categories
+#              (c) Adjust for corticosteroid use (if available)
+# Covariates:  Age, Sex, Ethnicity, IMD, BMI, N_comorbidities
+#
+# Improvements over v1:
+#   [1] Pre-specified reference WHO category (most common)
+#   [2] Pairwise WHO×Time contrasts with BH correction
+#   [3] LRT: interaction model vs null (no-interaction) model
+#   [4] Partial η² effect size for the interaction term
+#   [5] Random slope model check (AIC comparison)
+#   [6] Treatment confounding sensitivity (corticosteroid use)
+#   [7] Observed means plot alongside predicted trajectories
+#   [8] Clarified primary vs secondary model designation
+# =============================================================================
+
+# --- 0. Packages --------------------------------------------------------------
+library(tidyverse)      # data wrangling + ggplot2
+library(lme4)           # lmer()
+library(lmerTest)       # Satterthwaite p-values
+library(broom.mixed)    # tidy() for lmer objects
+library(emmeans)        # marginal means & pairwise contrasts
+library(effectsize)     # eta_squared()
+library(car)            # vif()
+library(influence.ME)   # Cook's distance for LMM
+library(knitr)          # kable()
+library(scales)         # log axis labels
+library(patchwork)      # combine ggplots
+
+# =============================================================================
+# 1. DATA PREPARATION
+# =============================================================================
+# Expected long-format data, one row per subject × marker × timepoint:
+#   subject_id        : unique patient identifier
+#   timepoint         : factor "T1" / "T2"
+#   time_bin          : numeric 0 (T1) / 1 (T2)
+#   marker            : character — biomarker name
+#   value             : numeric — raw marker value (no zeros expected)
+#   log_value         : numeric — log(value)
+#   who_cat           : factor — WHO severity class (e.g. 3,4,5,6,7)
+#   who_ord           : numeric — WHO score as ordered numeric (for trend)
+#   who_dichot        : factor — "Mild-Moderate" / "Severe-Critical"
+#   age               : numeric
+#   sex               : factor ("Female" / "Male")
+#   ethnicity         : factor
+#   imd               : numeric
+#   bmi               : numeric
+#   n_comorbidities   : numeric
+#   corticosteroid_use: logical/factor (TRUE/FALSE) — for sensitivity analysis
+
+# ---- 1a. Load your data -----------------------------------------------------
+# df_raw <- read_csv("your_data.csv") |>
+#   mutate(
+#     timepoint          = factor(timepoint, levels = c("T1", "T2")),
+#     time_bin           = as.integer(timepoint) - 1L,
+#     log_value          = log(value),
+#     who_cat            = factor(who_score),
+#     who_ord            = as.numeric(as.character(who_score)),
+#     who_dichot         = factor(
+#       if_else(who_ord <= 4, "Mild-Moderate", "Severe-Critical"),
+#       levels = c("Mild-Moderate", "Severe-Critical")
+#     ),
+#     sex                = factor(sex, levels = c("Female", "Male")),
+#     ethnicity          = factor(ethnicity),
+#     imd                = as.numeric(imd),
+#     corticosteroid_use = factor(corticosteroid_use)
+#   )
+
+# ---- 1b. Simulated example data (remove when using real data) ---------------
+set.seed(42)
+n_subjects <- 214
+markers    <- c("CRP", "IL6", "TNFa", "Ferritin")
+
+subj_df <- tibble(
+  subject_id         = paste0("S", str_pad(1:n_subjects, 3, pad = "0")),
+  age                = rnorm(n_subjects, 55, 12),
+  sex                = factor(sample(c("Female", "Male"), n_subjects,
+                                     replace = TRUE),
+                              levels = c("Female", "Male")),
+  ethnicity          = factor(sample(c("White", "South Asian", "Black", "Other"),
+                                     n_subjects, replace = TRUE,
+                                     prob = c(0.60, 0.18, 0.12, 0.10))),
+  imd                = rnorm(n_subjects, 25, 10),
+  bmi                = rnorm(n_subjects, 27, 5),
+  n_comorbidities    = rpois(n_subjects, lambda = 2),
+  who_score          = sample(3:7, n_subjects, replace = TRUE,
+                               prob = c(0.20, 0.25, 0.25, 0.20, 0.10)),
+  # Corticosteroids more likely in severe patients
+  corticosteroid_use = factor(rbinom(n_subjects, 1,
+                                     prob = plogis(-2 + 0.4 * sample(3:7,
+                                       n_subjects, replace = TRUE,
+                                       prob = c(0.20, 0.25, 0.25, 0.20, 0.10)) - 3)))
+) |>
+  mutate(
+    who_cat    = factor(who_score),
+    who_ord    = as.numeric(as.character(who_score)),
+    who_dichot = factor(
+      if_else(who_ord <= 4, "Mild-Moderate", "Severe-Critical"),
+      levels = c("Mild-Moderate", "Severe-Critical")
+    )
+  )
+
+df_raw <- expand_grid(subject_id = subj_df$subject_id, marker = markers) |>
+  left_join(subj_df, by = "subject_id") |>
+  mutate(
+    baseline_log = 3.0 + 0.15 * who_ord + rnorm(n(), 0, 0.6),
+    delta_log    = -0.10 - 0.08 * (who_ord - 3) + rnorm(n(), 0, 0.45),
+    T1           = exp(baseline_log),
+    T2           = exp(baseline_log + delta_log)
+  ) |>
+  mutate(T2 = if_else(runif(n()) < 0.10, NA_real_, T2)) |>
+  pivot_longer(cols = c(T1, T2), names_to = "timepoint", values_to = "value") |>
+  mutate(
+    timepoint = factor(timepoint, levels = c("T1", "T2")),
+    time_bin  = as.integer(timepoint) - 1L,
+    log_value = log(value)
+  )
+
+# ---- 1c. Quick data checks --------------------------------------------------
+cat("=== Data overview ===\n")
+glimpse(df_raw)
+
+cat("\n=== WHO class distribution (subjects) ===\n")
+who_counts <- subj_df |> count(who_cat)
+who_counts |> mutate(pct = round(100 * n / sum(n), 1)) |> print()
+
+cat("\n=== WHO dichotomy distribution ===\n")
+subj_df |> count(who_dichot) |> mutate(pct = round(100 * n / sum(n), 1)) |> print()
+
+cat("\n=== Missing values per marker & timepoint ===\n")
+df_raw |>
+  group_by(marker, timepoint) |>
+  summarise(n_obs    = n(),
+            n_miss   = sum(is.na(value)),
+            pct_miss = round(mean(is.na(value)) * 100, 1),
+            .groups  = "drop") |>
+  print()
+
+# ---- 1d. Sparse cell warning ------------------------------------------------
+sparse_who <- who_counts |> filter(n < 15)
+if (nrow(sparse_who) > 0) {
+  cat("\n⚠ WARNING: Sparse WHO categories (n < 15):\n")
+  print(sparse_who)
+  cat("  Consider collapsing adjacent categories before fitting primary model.\n")
+} else {
+  cat("\n✓ All WHO categories have n ≥ 15. No collapsing needed.\n")
+}
+
+# ---- 1e. [IMPROVEMENT 1] Pre-specify reference WHO category -----------------
+# Reference = most common WHO category (pre-specified, not data-driven).
+# Change this line if clinical reasoning suggests a different anchor.
+who_reference <- who_counts |> slice_max(n, n = 1) |> pull(who_cat) |>
+  as.character()
+cat(sprintf("\n✓ Pre-specified WHO reference category: %s (n = %d)\n",
+            who_reference,
+            who_counts |> filter(who_cat == who_reference) |> pull(n)))
+
+markers_list <- unique(df_raw$marker)
+
+# ---- 1f. Corticosteroid availability check ----------------------------------
+has_steroids <- "corticosteroid_use" %in% names(df_raw) &&
+  !all(is.na(df_raw$corticosteroid_use))
+cat(sprintf("\n%s corticosteroid data available for sensitivity analysis.\n",
+            if (has_steroids) "✓" else "✗ No"))
+
+# =============================================================================
+# 2. PRIMARY LMM — Categorical WHO × Time (PRIMARY model)
+# =============================================================================
+
+run_lmm_cat <- function(mk, data, ref_cat = who_reference) {
+
+  df_mk <- data |>
+    filter(marker == mk) |>
+    filter(!is.na(log_value), !is.na(age), !is.na(sex), !is.na(bmi),
+           !is.na(ethnicity), !is.na(imd), !is.na(n_comorbidities))
+
+  # Apply pre-specified reference category
+  df_mk <- df_mk |>
+    mutate(who_cat = relevel(droplevels(who_cat), ref = ref_cat))
+
+  # ---- 2a. Interaction model (primary) --------------------------------------
+  fit_int <- tryCatch(
+    lmer(log_value ~ time_bin * who_cat +
+           age + sex + ethnicity + imd + bmi + n_comorbidities +
+           (1 | subject_id),
+         data = df_mk, REML = TRUE),
+    error = function(e) { message("Primary LMM failed for ", mk, ": ", e$message); NULL }
+  )
+  if (is.null(fit_int)) return(NULL)
+
+  # ---- [IMPROVEMENT 3] LRT: interaction vs null (no-interaction) model ------
+  # Refit both with REML = FALSE for valid LRT
+  fit_int_ml <- tryCatch(
+    update(fit_int, REML = FALSE),
+    error = function(e) NULL
+  )
+  fit_null_ml <- tryCatch(
+    lmer(log_value ~ time_bin + who_cat +
+           age + sex + ethnicity + imd + bmi + n_comorbidities +
+           (1 | subject_id),
+         data = df_mk, REML = FALSE),
+    error = function(e) NULL
+  )
+
+  lrt_result <- if (!is.null(fit_int_ml) && !is.null(fit_null_ml)) {
+    lrt <- anova(fit_null_ml, fit_int_ml)
+    list(
+      chi_sq = lrt$Chisq[2],
+      df     = lrt$Df[2],
+      p      = lrt$`Pr(>Chisq)`[2]
+    )
+  } else list(chi_sq = NA, df = NA, p = NA)
+
+  # ---- 2b. Fixed effects from REML model ------------------------------------
+  tidy_fit        <- tidy(fit_int, effects = "fixed", conf.int = TRUE,
+                          conf.level = 0.95)
+  interaction_rows <- tidy_fit |> filter(str_detect(term, "time_bin:who_cat"))
+
+  # ---- 2c. Type III F-test for overall interaction --------------------------
+  anova_fit       <- anova(fit_int, type = "III")
+  interaction_f_p <- tryCatch(
+    anova_fit["time_bin:who_cat", "Pr(>F)"],
+    error = function(e) NA_real_
+  )
+
+  # ---- [IMPROVEMENT 4] Partial η² for interaction --------------------------
+  eta2_int <- tryCatch(
+    eta_squared(anova_fit, partial = TRUE) |>
+      as.data.frame() |>
+      filter(str_detect(Parameter, "time_bin:who_cat")) |>
+      pull(Eta2_partial),
+    error = function(e) NA_real_
+  )
+
+  # ---- 2d. emmeans: within-WHO GMR (T2 vs T1) -------------------------------
+  emm <- tryCatch(
+    emmeans(fit_int, ~ timepoint | who_cat,
+            at = list(time_bin = c(0, 1)),
+            pbkrtest.limit = 5000),
+    error = function(e) NULL
+  )
+
+  emm_within <- if (!is.null(emm)) {
+    contrast(emm, method = "revpairwise") |>
+      as.data.frame() |>
+      mutate(
+        GMR    = round(exp(estimate), 3),
+        GMR_lo = round(exp(estimate - 1.96 * SE), 3),
+        GMR_hi = round(exp(estimate + 1.96 * SE), 3),
+        p_adj  = round(p.adjust(p.value, method = "BH"), 3)
+      )
+  } else NULL
+
+  # ---- [IMPROVEMENT 2] Pairwise WHO contrasts: difference-in-differences ----
+  # Tests whether the T1→T2 change differs BETWEEN WHO categories
+  emm_time_who <- tryCatch(
+    emmeans(fit_int, ~ who_cat | timepoint,
+            at = list(time_bin = c(0, 1)),
+            pbkrtest.limit = 5000),
+    error = function(e) NULL
+  )
+
+  pairwise_contrasts <- if (!is.null(emm_time_who)) {
+    # Interaction contrasts: (T2-T1 in WHO_a) - (T2-T1 in WHO_b)
+    contrast(emm_time_who, interaction = c("pairwise", "revpairwise")) |>
+      as.data.frame() |>
+      mutate(
+        ratio_of_GMR = round(exp(estimate), 3),   # ratio of GMRs between WHO classes
+        p_adj        = round(p.adjust(p.value, method = "BH"), 3)
+      )
+  } else NULL
+
+  # ---- 2e. VIF check (main effects model) -----------------------------------
+  fit_main <- tryCatch(
+    lmer(log_value ~ time_bin + who_cat +
+           age + sex + ethnicity + imd + bmi + n_comorbidities +
+           (1 | subject_id),
+         data = df_mk, REML = TRUE),
+    error = function(e) NULL
+  )
+  vif_vals <- if (!is.null(fit_main)) tryCatch(vif(fit_main), error = function(e) NULL)
+
+  # ---- [IMPROVEMENT 5] Random slope model check (AIC) ----------------------
+  fit_rs <- tryCatch(
+    lmer(log_value ~ time_bin * who_cat +
+           age + sex + ethnicity + imd + bmi + n_comorbidities +
+           (1 + time_bin | subject_id),
+         data = df_mk, REML = TRUE,
+         control = lmerControl(optimizer = "bobyqa")),
+    error = function(e) NULL
+  )
+
+  rs_check <- if (!is.null(fit_rs)) {
+    list(
+      AIC_ri = AIC(fit_int),   # random intercept
+      AIC_rs = AIC(fit_rs),    # random slope
+      prefer = if (AIC(fit_rs) < AIC(fit_int) - 2) "random slope" else "random intercept"
+    )
+  } else list(AIC_ri = AIC(fit_int), AIC_rs = NA, prefer = "random intercept (slope failed)")
+
+  # ---- 2f. Normality diagnostics --------------------------------------------
+  resids   <- residuals(fit_int)
+  ranefs   <- ranef(fit_int)$subject_id[[1]]
+  sw_resid <- shapiro.test(resids)
+  sw_ranef <- shapiro.test(ranefs)
+
+  list(
+    marker             = mk,
+    fit_cat            = fit_int,
+    tidy_cat           = tidy_fit,
+    interaction_rows   = interaction_rows,
+    interaction_f_p    = interaction_f_p,
+    eta2_partial       = eta2_int,
+    lrt                = lrt_result,
+    emm_within         = emm_within,
+    pairwise_contrasts = pairwise_contrasts,
+    vif_vals           = vif_vals,
+    rs_check           = rs_check,
+    sw_resid           = sw_resid$p.value,
+    sw_ranef           = sw_ranef$p.value,
+    n_used             = nrow(df_mk),
+    n_subjects         = n_distinct(df_mk$subject_id)
+  )
+}
+
+cat("\n=== Fitting primary LMMs (categorical WHO × Time) ===\n")
+lmm_cat_results <- map(markers_list, run_lmm_cat, data = df_raw)
+names(lmm_cat_results) <- markers_list
+
+# =============================================================================
+# 3. SECONDARY LMM — Ordinal WHO × Time (trend test)
+# =============================================================================
+
+run_lmm_ord <- function(mk, data) {
+
+  df_mk <- data |>
+    filter(marker == mk) |>
+    filter(!is.na(log_value), !is.na(age), !is.na(sex), !is.na(bmi),
+           !is.na(ethnicity), !is.na(imd), !is.na(n_comorbidities))
+
+  fit <- tryCatch(
+    lmer(log_value ~ time_bin * who_ord +
+           age + sex + ethnicity + imd + bmi + n_comorbidities +
+           (1 | subject_id),
+         data = df_mk, REML = TRUE),
+    error = function(e) { message("Ordinal LMM failed for ", mk, ": ", e$message); NULL }
+  )
+  if (is.null(fit)) return(NULL)
+
+  tidy_fit  <- tidy(fit, effects = "fixed", conf.int = TRUE, conf.level = 0.95)
+  trend_row <- tidy_fit |> filter(term == "time_bin:who_ord")
+
+  list(
+    marker      = mk,
+    fit_ord     = fit,
+    tidy_ord    = tidy_fit,
+    trend_beta  = trend_row$estimate,
+    trend_se    = trend_row$std.error,
+    trend_p     = trend_row$p.value,
+    trend_ci_lo = trend_row$conf.low,
+    trend_ci_hi = trend_row$conf.high
+  )
+}
+
+cat("\n=== Fitting secondary LMMs (ordinal WHO trend) ===\n")
+lmm_ord_results <- map(markers_list, run_lmm_ord, data = df_raw)
+names(lmm_ord_results) <- markers_list
+
+# =============================================================================
+# 4. SUMMARY TABLES
+# =============================================================================
+
+# ---- 4a. Overall interaction test per marker --------------------------------
+cat("\n=== PRIMARY: WHO × Time Interaction — F-test + LRT + Effect Size ===\n")
+interaction_summary <- map_dfr(lmm_cat_results, \(x) {
+  if (is.null(x)) return(NULL)
+  tibble(
+    Marker          = x$marker,
+    N_subjects      = x$n_subjects,
+    N_obs           = x$n_used,
+    F_test_p        = signif(x$interaction_f_p, 3),
+    LRT_chi2        = round(x$lrt$chi_sq, 2),
+    LRT_df          = x$lrt$df,
+    LRT_p           = signif(x$lrt$p, 3),
+    Partial_eta2    = round(x$eta2_partial, 3),
+    AIC_rand_int    = round(x$rs_check$AIC_ri, 1),
+    AIC_rand_slope  = round(x$rs_check$AIC_rs, 1),
+    Preferred_model = x$rs_check$prefer,
+    SW_resid_p      = round(x$sw_resid, 3),
+    SW_ranef_p      = round(x$sw_ranef, 3)
+  )
+}) |>
+  mutate(
+    F_test_p_BH = round(p.adjust(F_test_p, method = "BH"), 3),
+    LRT_p_BH    = round(p.adjust(LRT_p, method = "BH"), 3)
+  ) |>
+  arrange(F_test_p)
+
+print(kable(interaction_summary, format = "simple"))
+
+# ---- 4b. Within-WHO GMR: T2 vs T1 per class ---------------------------------
+cat("\n=== Within-WHO-Class GMR (T2 vs T1) — BH corrected ===\n")
+emm_tbl <- map_dfr(lmm_cat_results, \(x) {
+  if (is.null(x) || is.null(x$emm_within)) return(NULL)
+  x$emm_within |> mutate(Marker = x$marker)
+}) |>
+  select(Marker, who_cat, estimate, SE, df, p.value, p_adj, GMR, GMR_lo, GMR_hi) |>
+  mutate(across(c(estimate, SE), \(v) round(v, 4)),
+         p.value = signif(p.value, 3))
+
+print(kable(emm_tbl, format = "simple"))
+
+# ---- [IMPROVEMENT 2] 4c. Pairwise WHO contrasts ----------------------------
+cat("\n=== Pairwise WHO × Time Contrasts (diff-in-diff, BH corrected) ===\n")
+pairwise_tbl <- map_dfr(lmm_cat_results, \(x) {
+  if (is.null(x) || is.null(x$pairwise_contrasts)) return(NULL)
+  x$pairwise_contrasts |> mutate(Marker = x$marker)
+}) |>
+  select(Marker, who_cat_pairwise, timepoint_revpairwise,
+         estimate, SE, p.value, p_adj, ratio_of_GMR) |>
+  mutate(across(c(estimate, SE), \(v) round(v, 4)),
+         p.value = signif(p.value, 3))
+
+print(kable(pairwise_tbl, format = "simple"))
+
+# ---- 4d. Ordinal trend summary ----------------------------------------------
+cat("\n=== SECONDARY: Ordinal WHO Trend × Time ===\n")
+trend_summary <- map_dfr(lmm_ord_results, \(x) {
+  if (is.null(x)) return(NULL)
+  tibble(
+    Marker     = x$marker,
+    Beta_trend = round(x$trend_beta, 4),
+    SE         = round(x$trend_se, 4),
+    CI_lo      = round(x$trend_ci_lo, 4),
+    CI_hi      = round(x$trend_ci_hi, 4),
+    P_raw      = signif(x$trend_p, 3)
+  )
+}) |>
+  mutate(P_BH = round(p.adjust(P_raw, method = "BH"), 3)) |>
+  arrange(P_raw)
+
+print(kable(trend_summary, format = "simple"))
+
+# ---- [IMPROVEMENT 5] 4e. Random slope model check --------------------------
+cat("\n=== Random Slope vs Random Intercept (AIC comparison) ===\n")
+rs_tbl <- map_dfr(lmm_cat_results, \(x) {
+  if (is.null(x)) return(NULL)
+  tibble(
+    Marker          = x$marker,
+    AIC_rand_int    = round(x$rs_check$AIC_ri, 1),
+    AIC_rand_slope  = round(x$rs_check$AIC_rs, 1),
+    Delta_AIC       = round(x$rs_check$AIC_rs - x$rs_check$AIC_ri, 1),
+    Preferred       = x$rs_check$prefer
+  )
+})
+print(kable(rs_tbl, format = "simple"))
+cat("  Note: prefer random slope if ΔAIC < -2 (slope model better by >2 AIC units)\n")
+
+# =============================================================================
+# 5. SENSITIVITY A — Dichotomised WHO
+# =============================================================================
+
+run_lmm_dichot <- function(mk, data) {
+
+  df_mk <- data |>
+    filter(marker == mk) |>
+    filter(!is.na(log_value), !is.na(who_dichot), !is.na(age),
+           !is.na(sex), !is.na(bmi), !is.na(ethnicity),
+           !is.na(imd), !is.na(n_comorbidities))
+
+  fit <- tryCatch(
+    lmer(log_value ~ time_bin * who_dichot +
+           age + sex + ethnicity + imd + bmi + n_comorbidities +
+           (1 | subject_id),
+         data = df_mk, REML = TRUE),
+    error = function(e) { message("Dichot LMM failed for ", mk, ": ", e$message); NULL }
+  )
+  if (is.null(fit)) return(NULL)
+
+  tidy_fit    <- tidy(fit, effects = "fixed", conf.int = TRUE, conf.level = 0.95)
+  interaction <- tidy_fit |> filter(str_detect(term, "time_bin:who_dichot"))
+
+  list(
+    marker     = mk,
+    int_beta   = interaction$estimate,
+    int_se     = interaction$std.error,
+    int_p      = interaction$p.value,
+    int_ci_lo  = interaction$conf.low,
+    int_ci_hi  = interaction$conf.high
+  )
+}
+
+cat("\n=== Sensitivity A: Dichotomised WHO × Time ===\n")
+lmm_dichot_results <- map(markers_list, run_lmm_dichot, data = df_raw)
+names(lmm_dichot_results) <- markers_list
+
+dichot_summary <- map_dfr(lmm_dichot_results, \(x) {
+  if (is.null(x)) return(NULL)
+  tibble(
+    Marker        = x$marker,
+    Beta_int      = round(x$int_beta, 4),
+    SE            = round(x$int_se, 4),
+    CI_lo         = round(x$int_ci_lo, 4),
+    CI_hi         = round(x$int_ci_hi, 4),
+    GMR_ratio     = round(exp(x$int_beta), 3),
+    P_raw         = signif(x$int_p, 3)
+  )
+}) |>
+  mutate(P_BH = round(p.adjust(P_raw, method = "BH"), 3)) |>
+  arrange(P_raw)
+
+print(kable(dichot_summary, format = "simple"))
+
+# =============================================================================
+# 6. SENSITIVITY B — Exclude sparse WHO categories
+# =============================================================================
+
+sparse_cats <- who_counts |> filter(n < 15) |> pull(who_cat) |> as.character()
+
+if (length(sparse_cats) > 0) {
+  cat(sprintf("\n=== Sensitivity B: Excluding sparse WHO categories (%s) ===\n",
+              paste(sparse_cats, collapse = ", ")))
+
+  df_excl         <- df_raw |> filter(!as.character(who_cat) %in% sparse_cats)
+  lmm_excl        <- map(markers_list, run_lmm_cat, data = df_excl)
+  names(lmm_excl) <- markers_list
+
+  excl_summary <- map_dfr(lmm_excl, \(x) {
+    if (is.null(x)) return(NULL)
+    tibble(Marker          = x$marker,
+           Interaction_p   = signif(x$interaction_f_p, 3),
+           N_subjects      = x$n_subjects)
+  }) |>
+    mutate(Interaction_p_BH = round(p.adjust(Interaction_p, method = "BH"), 3))
+
+  print(kable(excl_summary, format = "simple"))
+} else {
+  cat("\n✓ No sparse WHO categories — Sensitivity B not required.\n")
+}
+
+# =============================================================================
+# [IMPROVEMENT 6] 7. SENSITIVITY C — Adjust for corticosteroid use
+# =============================================================================
+
+if (has_steroids) {
+  cat("\n=== Sensitivity C: + Corticosteroid Use Adjustment ===\n")
+
+  run_lmm_steroids <- function(mk, data) {
+    df_mk <- data |>
+      filter(marker == mk) |>
+      filter(!is.na(log_value), !is.na(age), !is.na(sex), !is.na(bmi),
+             !is.na(ethnicity), !is.na(imd), !is.na(n_comorbidities),
+             !is.na(corticosteroid_use)) |>
+      mutate(who_cat = relevel(droplevels(who_cat), ref = who_reference))
+
+    fit <- tryCatch(
+      lmer(log_value ~ time_bin * who_cat +
+             age + sex + ethnicity + imd + bmi + n_comorbidities +
+             corticosteroid_use +                  # treatment confounder
+             (1 | subject_id),
+           data = df_mk, REML = TRUE),
+      error = function(e) { message("Steroid LMM failed for ", mk, ": ", e$message); NULL }
+    )
+    if (is.null(fit)) return(NULL)
+
+    anova_fit <- anova(fit, type = "III")
+    int_p     <- tryCatch(anova_fit["time_bin:who_cat", "Pr(>F)"],
+                          error = function(e) NA_real_)
+
+    list(marker = mk, interaction_p = int_p,
+         n_used = nrow(df_mk), n_subjects = n_distinct(df_mk$subject_id))
+  }
+
+  lmm_steroid_results <- map(markers_list, run_lmm_steroids, data = df_raw)
+  names(lmm_steroid_results) <- markers_list
+
+  steroid_summary <- map_dfr(lmm_steroid_results, \(x) {
+    if (is.null(x)) return(NULL)
+    tibble(Marker = x$marker, N_subjects = x$n_subjects,
+           Interaction_p = signif(x$interaction_p, 3))
+  }) |>
+    mutate(Interaction_p_BH = round(p.adjust(Interaction_p, method = "BH"), 3))
+
+  print(kable(steroid_summary, format = "simple"))
+  cat("  Interpretation: compare these p-values to primary model.\n",
+      " If attenuation is large, corticosteroid use may partly explain\n",
+      " the WHO × trajectory association.\n")
+} else {
+  cat("\n✗ Sensitivity C skipped — corticosteroid data not available.\n",
+      "  Recommend collecting this variable; flag as limitation in paper.\n")
+}
+
+# =============================================================================
+# 8. DIAGNOSTICS — residual & Q-Q plots
+# =============================================================================
+
+diag_plots_cat <- function(mk) {
+  res_obj <- lmm_cat_results[[mk]]
+  if (is.null(res_obj)) return(invisible(NULL))
+  fit    <- res_obj$fit_cat
+  resids <- residuals(fit)
+  ranefs <- ranef(fit)$subject_id[[1]]
+  fv     <- fitted(fit)
+
+  par(mfrow = c(2, 2))
+  plot(fv, resids,
+       main = paste0(mk, " [Obj4]: Residuals vs Fitted"),
+       xlab = "Fitted", ylab = "Residuals",
+       pch = 19, cex = 0.5, col = "steelblue")
+  abline(h = 0, lty = 2, col = "red")
+  qqnorm(resids, main = paste0(mk, " [Obj4]: Q-Q Residuals"),
+         pch = 19, cex = 0.6, col = "steelblue")
+  qqline(resids, col = "red", lwd = 1.5)
+  qqnorm(ranefs, main = paste0(mk, " [Obj4]: Q-Q Random Intercepts"),
+         pch = 19, cex = 0.8, col = "darkorange")
+  qqline(ranefs, col = "red", lwd = 1.5)
+  hist(resids, breaks = 20,
+       main = paste0(mk, " [Obj4]: Residual Distribution"),
+       xlab = "Residuals", col = "steelblue", border = "white")
+  par(mfrow = c(1, 1))
+}
+
+pdf("diagnostic_plots_obj4.pdf", width = 10, height = 8)
+walk(markers_list, diag_plots_cat)
+dev.off()
+cat("\nDiagnostic plots saved to: diagnostic_plots_obj4.pdf\n")
+
+# =============================================================================
+# 9. COOK'S DISTANCE
+# =============================================================================
+
+run_influence_cat <- function(mk) {
+  res_obj   <- lmm_cat_results[[mk]]
+  if (is.null(res_obj)) return(invisible(NULL))
+  fit       <- res_obj$fit_cat
+  infl      <- influence(fit, group = "subject_id")
+  cooks     <- cooks.distance(infl)
+  threshold <- 4 / length(cooks)
+  flagged   <- names(cooks[cooks > threshold])
+  cat(sprintf("\n%s — Cook's D threshold %.4f: %d flagged: %s\n",
+              mk, threshold, length(flagged),
+              if (length(flagged) == 0) "none" else paste(flagged, collapse = ", ")))
+}
+
+cat("\n=== Cook's Distance (primary model) ===\n")
+walk(markers_list, run_influence_cat)
+
+# =============================================================================
+# [IMPROVEMENT 7] 10. VISUALISATION — Predicted + Observed trajectories
+# =============================================================================
+
+# merTools for CI bands on predictions
+if (requireNamespace("merTools", quietly = TRUE)) {
+  library(merTools)
+} else {
+  message("merTools not installed — CI bands unavailable. Install with: install.packages('merTools')")
+  predictInterval <- function(merMod, newdata, ...) {
+    tibble(fit = predict(merMod, newdata = newdata, re.form = NA),
+           lwr = NA_real_, upr = NA_real_)
+  }
+}
+
+plot_trajectories <- function(mk) {
+
+  res_obj <- lmm_cat_results[[mk]]
+  if (is.null(res_obj)) return(NULL)
+  fit        <- res_obj$fit_cat
+  who_levels <- levels(df_raw$who_cat)
+
+  # ---- Panel A: Model-predicted geometric means (marginal) ------------------
+  pred_grid <- expand_grid(
+    time_bin        = c(0, 1),
+    who_cat         = factor(who_levels),
+    age             = mean(df_raw$age, na.rm = TRUE),
+    sex             = factor("Female", levels = c("Female", "Male")),
+    ethnicity       = factor(levels(df_raw$ethnicity)[1],
+                             levels = levels(df_raw$ethnicity)),
+    imd             = mean(df_raw$imd, na.rm = TRUE),
+    bmi             = mean(df_raw$bmi, na.rm = TRUE),
+    n_comorbidities = median(df_raw$n_comorbidities, na.rm = TRUE)
+  ) |>
+    mutate(timepoint = factor(if_else(time_bin == 0, "T1", "T2"),
+                              levels = c("T1", "T2")))
+
+  pred_df <- tryCatch({
+    pp <- predictInterval(fit, newdata = pred_grid, level = 0.95,
+                          n.sims = 500, stat = "median",
+                          type = "linear.prediction",
+                          include.resid.var = FALSE)
+    bind_cols(pred_grid, pp) |> mutate(across(c(fit, upr, lwr), exp))
+  }, error = function(e) {
+    pred_grid |>
+      mutate(fit = exp(predict(fit, newdata = pred_grid, re.form = NA)),
+             lwr = NA_real_, upr = NA_real_)
+  })
+
+  p_predicted <- ggplot(pred_df,
+                        aes(x = timepoint, y = fit,
+                            colour = who_cat, group = who_cat)) +
+    geom_ribbon(aes(ymin = lwr, ymax = upr, fill = who_cat),
+                alpha = 0.12, colour = NA) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2.5) +
+    scale_y_log10(labels = scales::comma) +
+    scale_colour_viridis_d(name = "WHO", option = "C", end = 0.85) +
+    scale_fill_viridis_d(name = "WHO",   option = "C", end = 0.85) +
+    labs(title    = "Model-predicted",
+         subtitle = "Geometric mean (95% CI)\nAdjusted for covariates at mean/modal values",
+         x = "Timepoint",
+         y = paste0(mk, " (geometric mean)")) +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.minor = element_blank())
+
+  # ---- [IMPROVEMENT 7] Panel B: Observed means ± SD ------------------------
+  obs_df <- df_raw |>
+    filter(marker == mk, !is.na(log_value)) |>
+    group_by(who_cat, timepoint) |>
+    summarise(
+      obs_mean = exp(mean(log_value, na.rm = TRUE)),   # geometric mean
+      obs_lo   = exp(mean(log_value) - sd(log_value) / sqrt(n())),
+      obs_hi   = exp(mean(log_value) + sd(log_value) / sqrt(n())),
+      n        = n(),
+      .groups  = "drop"
+    )
+
+  p_observed <- ggplot(obs_df,
+                       aes(x = timepoint, y = obs_mean,
+                           colour = who_cat, group = who_cat)) +
+    geom_errorbar(aes(ymin = obs_lo, ymax = obs_hi),
+                  width = 0.1, linewidth = 0.6) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2.5) +
+    geom_text(aes(label = paste0("n=", n)), vjust = -1.2, size = 3,
+              show.legend = FALSE) +
+    scale_y_log10(labels = scales::comma) +
+    scale_colour_viridis_d(name = "WHO", option = "C", end = 0.85) +
+    labs(title    = "Observed",
+         subtitle = "Geometric mean ± SEM\n(unadjusted raw data)",
+         x = "Timepoint",
+         y = paste0(mk, " (geometric mean)")) +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.minor = element_blank())
+
+  # Combine side by side using patchwork
+  (p_predicted | p_observed) +
+    plot_annotation(
+      title   = paste0("Objective 4: ", mk, " — Trajectories by WHO Severity"),
+      caption = paste0("Reference WHO category: ", who_reference,
+                       " | Left: model-adjusted predictions | Right: raw observed means")
+    )
+}
+
+trajectory_plots <- map(markers_list, plot_trajectories)
+names(trajectory_plots) <- markers_list
+
+pdf("trajectory_plots_obj4.pdf", width = 14, height = 6)
+walk(trajectory_plots, \(p) if (!is.null(p)) print(p))
+dev.off()
+cat("Trajectory plots saved to: trajectory_plots_obj4.pdf\n")
+
+# =============================================================================
+# 11. EXPORT RESULTS
+# =============================================================================
+
+write_csv(interaction_summary, "lmm_interaction_categorical_obj4.csv")
+write_csv(emm_tbl,             "emmeans_gmr_by_who_obj4.csv")
+write_csv(pairwise_tbl,        "pairwise_who_contrasts_obj4.csv")
+write_csv(trend_summary,       "lmm_trend_ordinal_obj4.csv")
+write_csv(dichot_summary,      "sensitivity_A_dichot_who_obj4.csv")
+write_csv(rs_tbl,              "random_slope_check_obj4.csv")
+if (has_steroids) write_csv(steroid_summary, "sensitivity_C_steroids_obj4.csv")
+
+cat("\n=== Done. Output files ===\n")
+cat("  lmm_interaction_categorical_obj4.csv — F-test, LRT, η², AIC check\n")
+cat("  emmeans_gmr_by_who_obj4.csv          — GMR within each WHO class\n")
+cat("  pairwise_who_contrasts_obj4.csv      — pairwise WHO diff-in-diff\n")
+cat("  lmm_trend_ordinal_obj4.csv           — ordinal trend β\n")
+cat("  sensitivity_A_dichot_who_obj4.csv    — dichotomised WHO sensitivity\n")
+cat("  random_slope_check_obj4.csv          — AIC: RI vs RS model\n")
+if (has_steroids) cat("  sensitivity_C_steroids_obj4.csv      — corticosteroid adjustment\n")
+cat("  trajectory_plots_obj4.pdf            — predicted + observed side-by-side\n")
+cat("  diagnostic_plots_obj4.pdf            — residual diagnostics\n")
