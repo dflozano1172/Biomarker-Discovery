@@ -1,9 +1,9 @@
-Section 1 — Data prep. Expects long-format data with subject_id, timepoint, value, age, sex, bmi. A simulated dataset with 80 subjects × 4 markers is included so you can run it immediately and swap in your real data at section 1c.
-Section 2 — LMM per marker. Fits log(marker) ~ time_bin + age + sex + bmi + (1|subject_id) using lme4/lmerTest (Satterthwaite p-values). Extracts β₁, 95% CI, and back-transforms to a geometric mean ratio (T2/T1).
-Section 3 — Multiple testing. Adds Benjamini-Hochberg adjusted p-values alongside raw p-values — the gap that was missing from your original plan.
-Section 4 — Paired t-test. Complete-cases sensitivity analysis on log scale, also BH-corrected.
-Section 5 — Diagnostics. Residuals vs fitted, Q-Q plots for both residuals and random intercepts, and a residual histogram — all saved to a single PDF.
-Section 6 — Influence. Cook's distance via influence.ME, flags subjects above the 4/n threshold.
-Section 7 — Forest plot. GMR with 95% CI on a log₁₀ axis, with BH-significance stars.
-Section 8 — Robust LMM. Commented-out block using robustlmm — uncomment if Cook's distance flags many outliers.
-Section 9 — Export. Two CSVs and two PDFs written to your working directory.
+* Section 1 — Data prep. Expects long-format data with subject_id, timepoint, value, age, sex, bmi. A simulated dataset with 80 subjects × 4 markers is included so you can run it immediately and swap in your real data at section 1c.
+* Section 2 — LMM per marker. Fits log(marker) ~ time_bin + age + sex + bmi + (1|subject_id) using lme4/lmerTest (Satterthwaite p-values). Extracts β₁, 95% CI, and back-transforms to a geometric mean ratio (T2/T1).
+* Section 3 — Multiple testing. Adds Benjamini-Hochberg adjusted p-values alongside raw p-values — the gap that was missing from your original plan.
+* Section 4 — Paired t-test. Complete-cases sensitivity analysis on log scale, also BH-corrected.
+* Section 5 — Diagnostics. Residuals vs fitted, Q-Q plots for both residuals and random intercepts, and a residual histogram — all saved to a single PDF.
+* Section 6 — Influence. Cook's distance via influence.ME, flags subjects above the 4/n threshold.
+* Section 7 — Forest plot. GMR with 95% CI on a log₁₀ axis, with BH-significance stars.
+* Section 8 — Robust LMM. Commented-out block using robustlmm — uncomment if Cook's distance flags many outliers.
+* Section 9 — Export. Two CSVs and two PDFs written to your working directory.
