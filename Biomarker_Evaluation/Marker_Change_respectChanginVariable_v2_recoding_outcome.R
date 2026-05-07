@@ -479,6 +479,34 @@ cat("\n=== Fitting PRIMARY LMMs (Transition-Pattern × Time) ===\n")
 lmm_pattern_results <- map(markers_list, run_lmm_pattern, data = df_raw)
 names(lmm_pattern_results) <- markers_list
 
+
+library(geepack)
+# =============================================================================
+# 2.1. SECONDARY — Option A: T2 Recovery as Fixed Stratifier
+# =============================================================================
+
+
+run_gee_optA <- function(mk, data) {
+# Ensure subject_id is factor if needed
+df_mk$subject_id <- as.factor(df_mk$subject_id)
+
+# GEE model: same fixed effects, id=subject_id for clustering, corstr="ar1" for time
+gee_fit <- geeglm(log_value ~ time_bin * traj_pattern + 
+                  age + sex + ethnicity + imd + bmi + n_comorbidities,
+                  data = data,
+                  id = subject_id,           # clustering variable (replaces | subject_id)
+                  family = gaussian(),       # for log_value (continuous)
+                  corstr = "ar1",            # AR1 for time-series; alternatives: "exchangeable", "unstructured"
+                  std.err = "san.qv")        # robust sandwich SEs (default)
+
+# Summary
+summary(gee_fit)
+
+# Tidy for forest plot (broom-compatible)
+library(broom.mixed)
+tidy(gee_fit, conf.int = TRUE, exponentiate = FALSE)
+}
+         
 # =============================================================================
 # 3. SECONDARY — Option A: T2 Recovery as Fixed Stratifier
 # =============================================================================
