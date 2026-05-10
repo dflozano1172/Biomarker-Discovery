@@ -791,3 +791,37 @@ cat("  random_slope_check_obj4.csv          — AIC: RI vs RS model\n")
 if (has_steroids) cat("  sensitivity_C_steroids_obj4.csv      — corticosteroid adjustment\n")
 cat("  trajectory_plots_obj4.pdf            — predicted + observed side-by-side\n")
 cat("  diagnostic_plots_obj4.pdf            — residual diagnostics\n")
+
+
+
+
+
+
+
+# =============================================================================
+# 12. GEE IF NORMALITY IS NOT MET BY THE LMM
+# =============================================================================
+
+
+
+library(geepack)
+library(dplyr)
+
+# Ensure subject_id is factor if needed
+df_mk$subject_id <- as.factor(df_mk$subject_id)
+
+# GEE model: same fixed effects, id=subject_id for clustering, corstr="ar1" for time
+gee_fit <- geeglm(log_value ~ time_bin * traj_pattern + 
+                  age + sex + ethnicity + imd + bmi + n_comorbidities,
+                  data = df_mk,
+                  id = subject_id,           # clustering variable (replaces | subject_id)
+                  family = gaussian(),       # for log_value (continuous)
+                  corstr = "ar1",            # AR1 for time-series; alternatives: "exchangeable", "unstructured"
+                  std.err = "san.qv")        # robust sandwich SEs (default)
+
+# Summary
+summary(gee_fit)
+
+# Tidy for forest plot (broom-compatible)
+library(broom.mixed)
+tidy(gee_fit, conf.int = TRUE, exponentiate = FALSE)
